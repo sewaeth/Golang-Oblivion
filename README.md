@@ -68,9 +68,42 @@ Pipe through `jq` for pretty printing:
 
 ## Architecture
 
-- `/config` - Safe configuration with validation
-- `/start` - Parallel (multi-shard) or Sequential (rotation) modes  
-- `/stop` - Graceful shutdown with sync.Once protection
+```mermaid
+graph TD
+    User([User])
+    Discord[Discord Platform]
+    
+    subgraph "Golang-Oblivion"
+        Entry[cmd/oblivion]
+        
+        subgraph "Internal Packages"
+            Config[internal/config]
+            Bot[internal/bot]
+            Webhook[internal/webhook]
+        end
+        
+        Entry -->|Init| Config
+        Entry -->|Start| Bot
+        
+        Bot -->|Handle Interaction| Webhook
+        
+        subgraph "Execution Logic"
+            Webhook -->|Load| Shards{Shards}
+            Shards -->|Mode: Parallel| Parallel[Goroutines]
+            Shards -->|Mode: Sequential| Seq[Sequential Loop]
+        end
+    end
+    
+    User -->|Slash Command| Discord
+    Discord -->|Gateway Event| Bot
+    
+    Parallel -->|POST| Discord
+    Seq -->|POST| Discord
+    
+    Config -.->|Reads| Files[(.toml Configs)]
+```
+
+
 
 ## Troubleshooting
 

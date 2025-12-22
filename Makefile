@@ -13,7 +13,7 @@ help:
 ## build: Build the application binary
 build:
 	@echo "Building..."
-	@go build -o bin/oblivion .
+	@go build -o bin/oblivion ./cmd/oblivion
 
 ## test: Run tests with race detection
 test:

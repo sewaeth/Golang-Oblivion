@@ -1,4 +1,4 @@
-package main
+package webhook
 
 import (
 	"bytes"
@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/seweath/Golang-Oblivion/internal/config"
 )
 
 // WebhookGroups holds the shard names as keys and lists of webhook URLs as values
@@ -47,8 +48,8 @@ func LoadWebhookGroups(filePath string) (WebhookGroups, error) {
 }
 
 // sendWebhook sends a single message to the webhook URL, handling retries and rate limits
-func sendWebhook(url string, payload MessagePayload, config *Config, client *http.Client, globalCount *int, mu *sync.Mutex, shardName string) bool {
-	for attempt := 0; attempt < config.MaxRetries; attempt++ {
+func sendWebhook(url string, payload MessagePayload, cfg *config.Config, client *http.Client, globalCount *int, mu *sync.Mutex, shardName string) bool {
+	for attempt := 0; attempt < cfg.MaxRetries; attempt++ {
 		jsonData, err := json.Marshal(payload)
 		if err != nil {
 			slog.Error("Failed to marshal webhook payload", "error", err)
@@ -65,8 +66,8 @@ func sendWebhook(url string, payload MessagePayload, config *Config, client *htt
 		resp, err := client.Do(req)
 		if err != nil {
 			slog.Warn("Webhook request failed", "error", err, "url", url, "attempt", attempt+1)
-			if attempt < config.MaxRetries-1 {
-				time.Sleep(time.Duration(config.RateLimitBackoff) * time.Second)
+			if attempt < cfg.MaxRetries-1 {
+				time.Sleep(time.Duration(cfg.RateLimitBackoff) * time.Second)
 			}
 			continue
 		}
@@ -97,7 +98,7 @@ func sendWebhook(url string, payload MessagePayload, config *Config, client *htt
 				slog.Warn("Rate limited, waiting", "url", url, "wait_duration", wait)
 				time.Sleep(wait)
 			} else {
-				time.Sleep(time.Duration(config.RateLimitBackoff) * time.Second)
+				time.Sleep(time.Duration(cfg.RateLimitBackoff) * time.Second)
 			}
 			continue
 		} else {
@@ -109,7 +110,7 @@ func sendWebhook(url string, payload MessagePayload, config *Config, client *htt
 }
 
 // webhookLoop runs the continuous sending loop for a single webhook
-func webhookLoop(url string, payload MessagePayload, config *Config, client *http.Client, sem chan struct{}, wg *sync.WaitGroup, stopCh chan struct{}, globalCount *int, mu *sync.Mutex, shardName string) {
+func webhookLoop(url string, payload MessagePayload, cfg *config.Config, client *http.Client, sem chan struct{}, wg *sync.WaitGroup, stopCh chan struct{}, globalCount *int, mu *sync.Mutex, shardName string) {
 	defer wg.Done()
 
 	for {
@@ -118,25 +119,25 @@ func webhookLoop(url string, payload MessagePayload, config *Config, client *htt
 			return
 		default:
 			mu.Lock()
-			if *globalCount >= config.MessageLimit {
+			if *globalCount >= cfg.MessageLimit {
 				mu.Unlock()
 				return
 			}
 			mu.Unlock()
 			// Acquire semaphore to limit concurrent requests per shard
 			sem <- struct{}{}
-			ok := sendWebhook(url, payload, config, client, globalCount, mu, shardName)
+			ok := sendWebhook(url, payload, cfg, client, globalCount, mu, shardName)
 			<-sem
 			if !ok {
 				slog.Error("Failed to send webhook after all retries", "url", url)
 			}
-			delay := config.Delay
+			delay := cfg.Delay
 			// Clamp to min/max if set
-			if config.MinDelay > 0 && delay < config.MinDelay {
-				delay = config.MinDelay
+			if cfg.MinDelay > 0 && delay < cfg.MinDelay {
+				delay = cfg.MinDelay
 			}
-			if config.MaxDelay > 0 && delay > config.MaxDelay {
-				delay = config.MaxDelay
+			if cfg.MaxDelay > 0 && delay > cfg.MaxDelay {
+				delay = cfg.MaxDelay
 			}
 			time.Sleep(time.Duration(delay * float64(time.Second)))
 		}
@@ -144,16 +145,16 @@ func webhookLoop(url string, payload MessagePayload, config *Config, client *htt
 }
 
 // StartShard starts goroutines for all webhooks in a shard
-func StartShard(shardName string, groups WebhookGroups, config *Config, stopCh chan struct{}, globalCount *int, mu *sync.Mutex, wg *sync.WaitGroup) {
+func StartShard(shardName string, groups WebhookGroups, cfg *config.Config, stopCh chan struct{}, globalCount *int, mu *sync.Mutex, wg *sync.WaitGroup) {
 	webhooks := groups[shardName]
 	payload := MessagePayload{
-		Content:   config.Message,
-		Username:  config.Username,
-		AvatarURL: config.AvatarURL,
+		Content:   cfg.Message,
+		Username:  cfg.Username,
+		AvatarURL: cfg.AvatarURL,
 	}
 
 	// Create one shared http.Client per shard
-	timeout := time.Duration(config.RequestTimeout * float64(time.Second))
+	timeout := time.Duration(cfg.RequestTimeout * float64(time.Second))
 	tr := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 100,
@@ -175,7 +176,7 @@ func StartShard(shardName string, groups WebhookGroups, config *Config, stopCh c
 
 	for _, url := range webhooks {
 		wg.Add(1)
-		go webhookLoop(url, payload, config, client, sem, wg, stopCh, globalCount, mu, shardName)
+		go webhookLoop(url, payload, cfg, client, sem, wg, stopCh, globalCount, mu, shardName)
 	}
 
 	// Close idle connections when the shard stops
@@ -188,7 +189,7 @@ func StartShard(shardName string, groups WebhookGroups, config *Config, stopCh c
 }
 
 // RunParallelMode runs selected shards in parallel
-func RunParallelMode(selectedShards []string, groups WebhookGroups, config *Config, globalCount *int, mu *sync.Mutex, userStopCh chan struct{}) {
+func RunParallelMode(selectedShards []string, groups WebhookGroups, cfg *config.Config, globalCount *int, mu *sync.Mutex, userStopCh chan struct{}) {
 	var wg sync.WaitGroup
 	stopChs := []chan struct{}{}
 	var closeOnce sync.Once
@@ -196,25 +197,23 @@ func RunParallelMode(selectedShards []string, groups WebhookGroups, config *Conf
 	for _, shard := range selectedShards {
 		stopCh := make(chan struct{})
 		stopChs = append(stopChs, stopCh)
-		StartShard(shard, groups, config, stopCh, globalCount, mu, &wg)
+		StartShard(shard, groups, cfg, stopCh, globalCount, mu, &wg)
 		fmt.Printf("Started shard: %s\n", shard)
 	}
 
 	// Wait for user stop
-	select {
-	case <-userStopCh:
-		fmt.Println("Stopping all shards...")
-		closeOnce.Do(func() {
-			for _, stopCh := range stopChs {
-				close(stopCh)
-			}
-		})
-		wg.Wait()
-	}
+	<-userStopCh
+	fmt.Println("Stopping all shards...")
+	closeOnce.Do(func() {
+		for _, stopCh := range stopChs {
+			close(stopCh)
+		}
+	})
+	wg.Wait()
 }
 
 // RunSequentialMode runs shards in sequence, cycling after total_pings
-func RunSequentialMode(startingShard string, groups WebhookGroups, config *Config, globalCount *int, mu *sync.Mutex, userStopCh chan struct{}) {
+func RunSequentialMode(startingShard string, groups WebhookGroups, cfg *config.Config, globalCount *int, mu *sync.Mutex, userStopCh chan struct{}) {
 	shardNames := make([]string, 0, len(groups))
 	for name := range groups {
 		shardNames = append(shardNames, name)
@@ -234,7 +233,7 @@ func RunSequentialMode(startingShard string, groups WebhookGroups, config *Confi
 		var currentWg sync.WaitGroup
 
 		fmt.Printf("Starting sequential shard: %s\n", currentShard)
-		StartShard(currentShard, groups, config, currentStopCh, globalCount, mu, &currentWg)
+		StartShard(currentShard, groups, cfg, currentStopCh, globalCount, mu, &currentWg)
 
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
@@ -246,8 +245,8 @@ func RunSequentialMode(startingShard string, groups WebhookGroups, config *Confi
 				mu.Lock()
 				total := *globalCount
 				mu.Unlock()
-				fmt.Printf("Shard %s progress: %d/%d pings\n", currentShard, total, config.TotalPings)
-				if total >= config.TotalPings {
+				fmt.Printf("Shard %s progress: %d/%d pings\n", currentShard, total, cfg.TotalPings)
+				if total >= cfg.TotalPings {
 					close(currentStopCh)
 					currentWg.Wait()
 					// Reset the global counter when switching to the next shard

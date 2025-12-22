@@ -1,6 +1,6 @@
 .env
 *.log
-oblivion
+/oblivion
 bin/
 coverage.out
 *.test

@@ -1,170 +1,30 @@
-package main
+package bot
 
 import (
-	"bytes"
 	"fmt"
 	"log/slog"
-	"os"
-	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
-	"github.com/BurntSushi/toml"
 	"github.com/bwmarrin/discordgo"
+	"github.com/seweath/Golang-Oblivion/internal/config"
+	"github.com/seweath/Golang-Oblivion/internal/webhook"
 )
-
-// Config holds the application configuration loaded from TOML
-type Config struct {
-	BotToken         string  `toml:"bot_token"`
-	GuildID          string  `toml:"guild_id"`
-	AvatarURL        string  `toml:"avatar_url"`
-	Delay            float64 `toml:"delay"`
-	MaxDelay         float64 `toml:"max_delay"`
-	MaxRetries       int     `toml:"max_retries"`
-	Message          string  `toml:"message"`
-	MessageLimit     int     `toml:"message_limit"`
-	MinDelay         float64 `toml:"min_delay"`
-	RateLimitBackoff float64 `toml:"rate_limit_backoff"`
-	RequestTimeout   float64 `toml:"request_timeout"`
-	TotalPings       int     `toml:"total_pings"`
-	Username         string  `toml:"username"`
-	WebhooksFile     string  `toml:"webhooks_file"`
-}
-
-// BotState holds the current state of bot operations
-type BotState struct {
-	mu           sync.Mutex
-	isRunning    bool
-	globalCount  int
-	stopCh       chan struct{}
-	userStopCh   chan struct{}
-	mode         string
-	activeShards []string
-}
 
 // Handler manages command interactions
 type Handler struct {
-	config     *Config
+	config     *config.Config
 	configPath string
 	state      *BotState
-	groups     WebhookGroups
-}
-
-// DefaultConfig provides fallback values
-var DefaultConfig = Config{
-	Message:          "@everyone",
-	Username:         "Oblivion",
-	AvatarURL:        "https://media.discordapp.net/attachments/1329536982237319239/1375174292303773876/blob-cat-ping.gif",
-	Delay:            2.5,
-	MaxRetries:       3,
-	MessageLimit:     9000,
-	TotalPings:       450000,
-	WebhooksFile:     "webhooks.toml",
-	MaxDelay:         5.0,
-	MinDelay:         0.5,
-	RateLimitBackoff: 60.0,
-	RequestTimeout:   10.0,
-}
-
-// loadConfig reads and parses the TOML config file
-func loadConfig(filePath string) (*Config, error) {
-	var config Config
-	if _, err := toml.DecodeFile(filePath, &config); err != nil {
-		return nil, fmt.Errorf("failed to parse config: %w", err)
-	}
-
-	// Apply defaults for missing fields
-	if config.Message == "" {
-		config.Message = DefaultConfig.Message
-	}
-	if config.Username == "" {
-		config.Username = DefaultConfig.Username
-	}
-	if config.AvatarURL == "" {
-		config.AvatarURL = DefaultConfig.AvatarURL
-	}
-	if config.Delay == 0 {
-		config.Delay = DefaultConfig.Delay
-	}
-	if config.RateLimitBackoff == 0 {
-		config.RateLimitBackoff = DefaultConfig.RateLimitBackoff
-	}
-	if config.MaxRetries == 0 {
-		config.MaxRetries = DefaultConfig.MaxRetries
-	}
-	if config.MessageLimit == 0 {
-		config.MessageLimit = DefaultConfig.MessageLimit
-	}
-	if config.TotalPings == 0 {
-		config.TotalPings = DefaultConfig.TotalPings
-	}
-	if config.WebhooksFile == "" {
-		config.WebhooksFile = DefaultConfig.WebhooksFile
-	}
-	if config.MaxDelay == 0 {
-		config.MaxDelay = DefaultConfig.MaxDelay
-	}
-	if config.MinDelay == 0 {
-		config.MinDelay = DefaultConfig.MinDelay
-	}
-	if config.RequestTimeout == 0 {
-		config.RequestTimeout = DefaultConfig.RequestTimeout
-	}
-
-	return &config, nil
-}
-
-// NewBotState creates a new bot state instance
-func NewBotState() *BotState {
-	return &BotState{
-		isRunning:   false,
-		globalCount: 0,
-	}
-}
-
-// IsRunning checks if webhook operations are currently running
-func (bs *BotState) IsRunning() bool {
-	bs.mu.Lock()
-	defer bs.mu.Unlock()
-	return bs.isRunning
-}
-
-// Start initializes a new operation session
-func (bs *BotState) Start(mode string, shards []string) {
-	bs.mu.Lock()
-	defer bs.mu.Unlock()
-	bs.isRunning = true
-	bs.globalCount = 0
-	bs.stopCh = make(chan struct{})
-	bs.userStopCh = make(chan struct{})
-	bs.mode = mode
-	bs.activeShards = shards
-}
-
-// Stop terminates the current operation session
-func (bs *BotState) Stop() {
-	bs.mu.Lock()
-	defer bs.mu.Unlock()
-	if bs.isRunning {
-		close(bs.userStopCh)
-		bs.isRunning = false
-	}
-}
-
-// GetStopChannel returns the user stop channel
-func (bs *BotState) GetStopChannel() chan struct{} {
-	bs.mu.Lock()
-	defer bs.mu.Unlock()
-	return bs.userStopCh
+	groups     webhook.WebhookGroups
 }
 
 // NewHandler creates a new command handler
-func NewHandler(config *Config, configPath string, groups WebhookGroups) *Handler {
+func NewHandler(cfg *config.Config, configPath string, groups webhook.WebhookGroups) *Handler {
 	return &Handler{
-		config:     config,
+		config:     cfg,
 		configPath: configPath,
 		state:      NewBotState(),
 		groups:     groups,
@@ -487,9 +347,9 @@ func (h *Handler) handleStartCommand(s *discordgo.Session, i *discordgo.Interact
 		var mu sync.Mutex
 
 		if mode == "parallel" {
-			RunParallelMode(shards, h.groups, h.webhookConfig(), &globalCount, &mu, h.state.GetStopChannel())
+			webhook.RunParallelMode(shards, h.groups, h.config, &globalCount, &mu, h.state.GetStopChannel())
 		} else {
-			RunSequentialMode(startingShard, h.groups, h.webhookConfig(), &globalCount, &mu, h.state.GetStopChannel())
+			webhook.RunSequentialMode(startingShard, h.groups, h.config, &globalCount, &mu, h.state.GetStopChannel())
 		}
 
 		h.state.Stop()
@@ -652,137 +512,5 @@ func (h *Handler) updateConfigField(field, value string) error {
 	}
 
 	// Save config to file
-	return h.saveConfig()
-}
-
-// saveConfig writes the config back to the TOML file (preserves comments natively)
-func (h *Handler) saveConfig() error {
-	// Read original file to preserve comments
-	data, err := os.ReadFile(h.configPath)
-	if err != nil {
-		return err
-	}
-
-	// Parse existing TOML
-	var doc interface{}
-	if _, err := toml.Decode(string(data), &doc); err != nil {
-		return err
-	}
-
-	// Create a buffer with config struct
-	var buf bytes.Buffer
-	encoder := toml.NewEncoder(&buf)
-	if err := encoder.Encode(h.config); err != nil {
-		return err
-	}
-
-	// Write back (TOML library preserves structure)
-	return os.WriteFile(h.configPath, buf.Bytes(), 0644)
-}
-
-// webhookConfig converts Handler config to webhook Config format
-func (h *Handler) webhookConfig() *Config {
-	return &Config{
-		AvatarURL:        h.config.AvatarURL,
-		Delay:            h.config.Delay,
-		MaxDelay:         h.config.MaxDelay,
-		MaxRetries:       h.config.MaxRetries,
-		Message:          h.config.Message,
-		MessageLimit:     h.config.MessageLimit,
-		MinDelay:         h.config.MinDelay,
-		RateLimitBackoff: h.config.RateLimitBackoff,
-		RequestTimeout:   h.config.RequestTimeout,
-		TotalPings:       h.config.TotalPings,
-		Username:         h.config.Username,
-		WebhooksFile:     h.config.WebhooksFile,
-	}
-}
-
-func main() {
-	// Initialize structured logging
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-	slog.SetDefault(logger)
-
-	slog.Info("Starting Golang-Oblivion Discord Bot", "version", "2.0")
-
-	configPath := "config.toml"
-	config, err := loadConfig(configPath)
-	if err != nil {
-		slog.Error("Failed to load configuration", "error", err, "path", configPath)
-		os.Exit(1)
-	}
-
-	// Load bot token from environment variable (preferred) or config file (fallback)
-	botToken := os.Getenv("OBLIVION_BOT_TOKEN")
-	if botToken == "" {
-		botToken = config.BotToken
-	}
-
-	// Validate bot token
-	if botToken == "" || botToken == "YOUR_BOT_TOKEN_HERE" {
-		slog.Error("Invalid bot token", "message", "Please set OBLIVION_BOT_TOKEN environment variable or update config.toml")
-		os.Exit(1)
-	}
-
-	// Load webhook groups
-	webhooksPath := config.WebhooksFile
-	groups, err := LoadWebhookGroups(webhooksPath)
-	if err != nil {
-		slog.Error("Failed to load webhook groups", "error", err, "path", webhooksPath)
-		os.Exit(1)
-	}
-
-	// Create Discord session
-	dg, err := discordgo.New("Bot " + botToken)
-	if err != nil {
-		slog.Error("Failed to create Discord session", "error", err)
-		os.Exit(1)
-	}
-
-	// Create command handler
-	handler := NewHandler(config, configPath, groups)
-
-	// Register event handlers
-	dg.AddHandler(handler.HandleInteraction)
-
-	// Set intents
-	dg.Identify.Intents = discordgo.IntentsGuilds
-
-	// Open connection to Discord
-	err = dg.Open()
-	if err != nil {
-		slog.Error("Failed to open connection to Discord", "error", err)
-		os.Exit(1)
-	}
-	defer dg.Close()
-
-	slog.Info("Bot connected to Discord, registering commands...")
-
-	// Register slash commands
-	err = RegisterCommands(dg, config.GuildID)
-	if err != nil {
-		slog.Error("Failed to register commands", "error", err)
-		os.Exit(1)
-	}
-
-	slog.Info("Commands registered successfully")
-	slog.Info("Bot is ready. Press CTRL+C to exit.")
-
-	// Wait for interrupt signal
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	<-stop
-
-	slog.Info("Shutdown signal received, cleaning up...")
-
-	// Unregister commands (optional, but clean)
-	slog.Info("Unregistering commands...")
-	err = UnregisterCommands(dg, config.GuildID)
-	if err != nil {
-		slog.Warn("Failed to unregister commands", "error", err)
-	}
-
-	slog.Info("Shutdown complete. Goodbye!")
+	return h.config.Save(h.configPath)
 }
