@@ -1,47 +1,59 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"log"
-	"math/rand"
-	"net/http"
+	"log/slog"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"github.com/BurntSushi/toml"
+	"github.com/bwmarrin/discordgo"
 )
 
-// Config holds the application configuration loaded from JSON.config2
+// Config holds the application configuration loaded from TOML
 type Config struct {
-	AvatarURL        string  `json:"avatar_url"`
-	Delay            float64 `json:"delay"`
-	MaxDelay         float64 `json:"max_delay"`
-	MaxRetries       int     `json:"max_retries"`
-	Message          string  `json:"message"`
-	MessageLimit     int     `json:"message_limit"`
-	MinDelay         float64 `json:"min_delay"`
-	RateLimitBackoff float64 `json:"rate_limit_backoff"`
-	RequestTimeout   float64 `json:"request_timeout"`
-	TotalPings       int     `json:"total_pings"`
-	Username         string  `json:"username"`
-	WebhooksFile     string  `json:"webhooks_file"`
+	BotToken         string  `toml:"bot_token"`
+	GuildID          string  `toml:"guild_id"`
+	AvatarURL        string  `toml:"avatar_url"`
+	Delay            float64 `toml:"delay"`
+	MaxDelay         float64 `toml:"max_delay"`
+	MaxRetries       int     `toml:"max_retries"`
+	Message          string  `toml:"message"`
+	MessageLimit     int     `toml:"message_limit"`
+	MinDelay         float64 `toml:"min_delay"`
+	RateLimitBackoff float64 `toml:"rate_limit_backoff"`
+	RequestTimeout   float64 `toml:"request_timeout"`
+	TotalPings       int     `toml:"total_pings"`
+	Username         string  `toml:"username"`
+	WebhooksFile     string  `toml:"webhooks_file"`
 }
 
-// WebhookGroups holds the shard names as keys and lists of webhook URLs as values.
-type WebhookGroups map[string][]string
-
-// MessagePayload represents the JSON payload for Discord webhook.
-type MessagePayload struct {
-	Content   string `json:"content"`
-	Username  string `json:"username,omitempty"`
-	AvatarURL string `json:"avatar_url,omitempty"`
+// BotState holds the current state of bot operations
+type BotState struct {
+	mu           sync.Mutex
+	isRunning    bool
+	globalCount  int
+	stopCh       chan struct{}
+	userStopCh   chan struct{}
+	mode         string
+	activeShards []string
 }
 
-// DefaultConfig provides fallback values.
+// Handler manages command interactions
+type Handler struct {
+	config     *Config
+	configPath string
+	state      *BotState
+	groups     WebhookGroups
+}
+
+// DefaultConfig provides fallback values
 var DefaultConfig = Config{
 	Message:          "@everyone",
 	Username:         "Oblivion",
@@ -50,22 +62,17 @@ var DefaultConfig = Config{
 	MaxRetries:       3,
 	MessageLimit:     9000,
 	TotalPings:       450000,
-	WebhooksFile:     "webhooks.json",
+	WebhooksFile:     "webhooks.toml",
 	MaxDelay:         5.0,
 	MinDelay:         0.5,
 	RateLimitBackoff: 60.0,
 	RequestTimeout:   10.0,
 }
 
-// loadConfig reads and parses the JSON config file.
+// loadConfig reads and parses the TOML config file
 func loadConfig(filePath string) (*Config, error) {
-	data, err := ioutil.ReadFile(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read config file: %w", err)
-	}
-
 	var config Config
-	if err := json.Unmarshal(data, &config); err != nil {
+	if _, err := toml.DecodeFile(filePath, &config); err != nil {
 		return nil, fmt.Errorf("failed to parse config: %w", err)
 	}
 
@@ -110,452 +117,672 @@ func loadConfig(filePath string) (*Config, error) {
 	return &config, nil
 }
 
-// saveConfig writes the config back to the JSON file.
-func saveConfig(config *Config, filePath string) error {
-	data, err := json.MarshalIndent(config, "", "  ")
+// NewBotState creates a new bot state instance
+func NewBotState() *BotState {
+	return &BotState{
+		isRunning:   false,
+		globalCount: 0,
+	}
+}
+
+// IsRunning checks if webhook operations are currently running
+func (bs *BotState) IsRunning() bool {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	return bs.isRunning
+}
+
+// Start initializes a new operation session
+func (bs *BotState) Start(mode string, shards []string) {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	bs.isRunning = true
+	bs.globalCount = 0
+	bs.stopCh = make(chan struct{})
+	bs.userStopCh = make(chan struct{})
+	bs.mode = mode
+	bs.activeShards = shards
+}
+
+// Stop terminates the current operation session
+func (bs *BotState) Stop() {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	if bs.isRunning {
+		close(bs.userStopCh)
+		bs.isRunning = false
+	}
+}
+
+// GetStopChannel returns the user stop channel
+func (bs *BotState) GetStopChannel() chan struct{} {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	return bs.userStopCh
+}
+
+// NewHandler creates a new command handler
+func NewHandler(config *Config, configPath string, groups WebhookGroups) *Handler {
+	return &Handler{
+		config:     config,
+		configPath: configPath,
+		state:      NewBotState(),
+		groups:     groups,
+	}
+}
+
+// RegisterCommands registers all slash commands with Discord
+func RegisterCommands(s *discordgo.Session, guildID string) error {
+	commands := []*discordgo.ApplicationCommand{
+		{
+			Name:        "config",
+			Description: "View or modify bot configuration",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "field",
+					Description: "Configuration field to modify",
+					Required:    false,
+					Choices: []*discordgo.ApplicationCommandOptionChoice{
+						{Name: "Message", Value: "message"},
+						{Name: "Username", Value: "username"},
+						{Name: "Avatar URL", Value: "avatar_url"},
+						{Name: "Delay", Value: "delay"},
+						{Name: "Min Delay", Value: "min_delay"},
+						{Name: "Max Delay", Value: "max_delay"},
+						{Name: "Rate Limit Backoff", Value: "rate_limit_backoff"},
+						{Name: "Max Retries", Value: "max_retries"},
+						{Name: "Message Limit", Value: "message_limit"},
+						{Name: "Total Pings", Value: "total_pings"},
+					},
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "value",
+					Description: "New value for the field",
+					Required:    false,
+				},
+			},
+		},
+		{
+			Name:        "start",
+			Description: "Start webhook operations",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "mode",
+					Description: "Operation mode",
+					Required:    true,
+					Choices: []*discordgo.ApplicationCommandOptionChoice{
+						{Name: "Parallel", Value: "parallel"},
+						{Name: "Sequential", Value: "sequential"},
+					},
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "shards",
+					Description: "Comma-separated list of shards (for parallel mode)",
+					Required:    false,
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionString,
+					Name:        "starting_shard",
+					Description: "Starting shard name (for sequential mode)",
+					Required:    false,
+				},
+			},
+		},
+		{
+			Name:        "stop",
+			Description: "Stop all webhook operations",
+		},
+	}
+
+	for _, cmd := range commands {
+		_, err := s.ApplicationCommandCreate(s.State.User.ID, guildID, cmd)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// UnregisterCommands removes all registered commands
+func UnregisterCommands(s *discordgo.Session, guildID string) error {
+	commands, err := s.ApplicationCommands(s.State.User.ID, guildID)
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(filePath, data, 0644)
+
+	for _, cmd := range commands {
+		err := s.ApplicationCommandDelete(s.State.User.ID, guildID, cmd.ID)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
-// loadWebhookGroups reads and parses the JSON webhooks file.
-func loadWebhookGroups(filePath string) (WebhookGroups, error) {
-	data, err := ioutil.ReadFile(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read webhooks file: %w", err)
+// HandleInteraction routes slash command interactions to appropriate handlers
+func (h *Handler) HandleInteraction(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	if i.Type != discordgo.InteractionApplicationCommand {
+		return
 	}
 
-	var groups WebhookGroups
-	if err := json.Unmarshal(data, &groups); err != nil {
-		return nil, fmt.Errorf("failed to parse webhooks: %w", err)
+	switch i.ApplicationCommandData().Name {
+	case "config":
+		h.handleConfigCommand(s, i)
+	case "start":
+		h.handleStartCommand(s, i)
+	case "stop":
+		h.handleStopCommand(s, i)
 	}
-
-	if len(groups) == 0 {
-		return nil, fmt.Errorf("no webhook groups found")
-	}
-
-	return groups, nil
 }
 
-// sendWebhook sends a single message to the webhook URL, handling retries and rate limits.
-func sendWebhook(url string, payload MessagePayload, config *Config, client *http.Client, globalCount *int, mu *sync.Mutex, shardName string) bool {
-	for attempt := 0; attempt < config.MaxRetries; attempt++ {
-		jsonData, err := json.Marshal(payload)
-		if err != nil {
-			log.Printf("Failed to marshal payload: %v", err)
-			return false
-		}
+// handleConfigCommand handles the /config command
+func (h *Handler) handleConfigCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	// Audit log
+	slog.Info("Command executed",
+		"command", "config",
+		"user_id", i.Member.User.ID,
+		"user_name", i.Member.User.Username,
+		"guild_id", i.GuildID,
+	)
 
-		req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
-		if err != nil {
-			log.Printf("Failed to create request: %v", err)
-			return false
-		}
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := client.Do(req)
-		if err != nil {
-			log.Printf("Request error for %s: %v", url, err)
-			if attempt < config.MaxRetries-1 {
-				time.Sleep(time.Duration(config.RateLimitBackoff) * time.Second)
-			}
-			continue
-		}
-		defer resp.Body.Close()
-
-		body, _ := ioutil.ReadAll(resp.Body)
-		if resp.StatusCode == 204 {
-			mu.Lock()
-			*globalCount++
-			count := *globalCount
-			mu.Unlock()
-			if shardName != "" {
-				fmt.Printf("Sent to %s (shard: %s, total: %d)\n", url, shardName, count)
-			} else {
-				fmt.Printf("Sent to %s (total: %d)\n", url, count)
-			}
-			return true
-		} else if resp.StatusCode == 429 {
-			var rateLimit struct {
-				RetryAfter float64 `json:"retry_after"`
-			}
-			if json.Unmarshal(body, &rateLimit) == nil && rateLimit.RetryAfter > 0 {
-				wait := time.Duration(rateLimit.RetryAfter * float64(time.Second))
-				log.Printf("Rate limited on %s, waiting %v", url, wait)
-				time.Sleep(wait)
-			} else {
-				time.Sleep(time.Duration(config.RateLimitBackoff) * time.Second)
-			}
-			continue
-		} else {
-			log.Printf("HTTP error %d for %s: %s", resp.StatusCode, url, string(body))
-			return false
-		}
+	options := i.ApplicationCommandData().Options
+	optionMap := make(map[string]*discordgo.ApplicationCommandInteractionDataOption)
+	for _, opt := range options {
+		optionMap[opt.Name] = opt
 	}
-	return false
+
+	// If no options, show current config
+	if len(optionMap) == 0 {
+		embed := &discordgo.MessageEmbed{
+			Title:       "Current Configuration",
+			Color:       0x00ff00,
+			Description: h.getConfigString(),
+			Timestamp:   time.Now().Format(time.RFC3339),
+		}
+
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Embeds: []*discordgo.MessageEmbed{embed},
+			},
+		})
+		return
+	}
+
+	// If field and value provided, update config
+	field, hasField := optionMap["field"]
+	value, hasValue := optionMap["value"]
+
+	if !hasField || !hasValue {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Please provide both field and value to update configuration.",
+			},
+		})
+		return
+	}
+
+	fieldName := field.StringValue()
+	newValue := value.StringValue()
+
+	if err := h.updateConfigField(fieldName, newValue); err != nil {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: fmt.Sprintf("Failed to update config: %v", err),
+			},
+		})
+		return
+	}
+
+	embed := &discordgo.MessageEmbed{
+		Title:       "Configuration Updated",
+		Color:       0x00ff00,
+		Description: fmt.Sprintf("**%s** has been updated to: `%s`", fieldName, newValue),
+		Timestamp:   time.Now().Format(time.RFC3339),
+	}
+
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Embeds: []*discordgo.MessageEmbed{embed},
+		},
+	})
 }
 
-// webhookLoop runs the continuous sending loop for a single webhook.
-func webhookLoop(url string, payload MessagePayload, config *Config, client *http.Client, sem chan struct{}, wg *sync.WaitGroup, stopCh chan struct{}, globalCount *int, mu *sync.Mutex, shardName string) {
-	defer wg.Done()
+// handleStartCommand handles the /start command
+func (h *Handler) handleStartCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	// Audit log
+	slog.Info("Command executed",
+		"command", "start",
+		"user_id", i.Member.User.ID,
+		"user_name", i.Member.User.Username,
+		"guild_id", i.GuildID,
+	)
 
-	rand.Seed(time.Now().UnixNano())
+	if h.state.IsRunning() {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "Webhook operations are already running. Use `/stop` first.",
+			},
+		})
+		return
+	}
 
-	for {
-		select {
-		case <-stopCh:
-			return
-		default:
-			mu.Lock()
-			if *globalCount >= config.MessageLimit {
-				mu.Unlock()
+	options := i.ApplicationCommandData().Options
+	optionMap := make(map[string]*discordgo.ApplicationCommandInteractionDataOption)
+	for _, opt := range options {
+		optionMap[opt.Name] = opt
+	}
+
+	mode := optionMap["mode"].StringValue()
+
+	var shards []string
+	var startingShard string
+
+	if mode == "parallel" {
+		if shardsOpt, ok := optionMap["shards"]; ok {
+			shardsStr := shardsOpt.StringValue()
+			shards = strings.Split(shardsStr, ",")
+			for i := range shards {
+				shards[i] = strings.TrimSpace(shards[i])
+			}
+
+			// Validate shards
+			validShards := []string{}
+			for _, shard := range shards {
+				if _, ok := h.groups[shard]; ok {
+					validShards = append(validShards, shard)
+				} else {
+					slog.Warn("Invalid shard name, skipping", "shard", shard)
+				}
+			}
+			shards = validShards
+
+			if len(shards) == 0 {
+				s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+					Type: discordgo.InteractionResponseChannelMessageWithSource,
+					Data: &discordgo.InteractionResponseData{
+						Content: "No valid shards provided for parallel mode.",
+					},
+				})
 				return
 			}
-			mu.Unlock()
-			// Acquire semaphore to limit concurrent requests per shard
-			sem <- struct{}{}
-			ok := sendWebhook(url, payload, config, client, globalCount, mu, shardName)
-			<-sem
-			if !ok {
-				log.Printf("Failed to send to %s after retries", url)
+		} else {
+			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Content: "Please provide shards for parallel mode.",
+				},
+			})
+			return
+		}
+	} else if mode == "sequential" {
+		if startingShardOpt, ok := optionMap["starting_shard"]; ok {
+			startingShard = strings.TrimSpace(startingShardOpt.StringValue())
+			if _, ok := h.groups[startingShard]; !ok {
+				s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+					Type: discordgo.InteractionResponseChannelMessageWithSource,
+					Data: &discordgo.InteractionResponseData{
+						Content: fmt.Sprintf("Invalid starting shard: %s", startingShard),
+					},
+				})
+				return
 			}
-			delay := config.Delay
-			// Clamp to min/max if set
-			if config.MinDelay > 0 && delay < config.MinDelay {
-				delay = config.MinDelay
-			}
-			if config.MaxDelay > 0 && delay > config.MaxDelay {
-				delay = config.MaxDelay
-			}
-			time.Sleep(time.Duration(delay * float64(time.Second)))
+		} else {
+			s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+				Type: discordgo.InteractionResponseChannelMessageWithSource,
+				Data: &discordgo.InteractionResponseData{
+					Content: "Please provide a starting shard for sequential mode.",
+				},
+			})
+			return
 		}
 	}
-}
 
-// startShard starts goroutines for all webhooks in a shard.
-func startShard(shardName string, groups WebhookGroups, config *Config, stopCh chan struct{}, globalCount *int, mu *sync.Mutex, wg *sync.WaitGroup) {
-	webhooks := groups[shardName]
-	payload := MessagePayload{
-		Content:   config.Message,
-		Username:  config.Username,
-		AvatarURL: config.AvatarURL,
+	// Start the operations
+	h.state.Start(mode, shards)
+
+	embed := &discordgo.MessageEmbed{
+		Title: "Starting Webhook Operations",
+		Color: 0x00ff00,
+		Fields: []*discordgo.MessageEmbedField{
+			{Name: "Mode", Value: mode, Inline: true},
+		},
+		Timestamp: time.Now().Format(time.RFC3339),
 	}
 
-	// Create one shared http.Client per shard to avoid creating a new Transport per request.
-	timeout := time.Duration(config.RequestTimeout * float64(time.Second))
-	// tuned transport to limit resources per shard
-	tr := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 100,
-		MaxConnsPerHost:     100,
-		IdleConnTimeout:     90 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
-	}
-	client := &http.Client{Transport: tr, Timeout: timeout}
-
-	// semaphore to limit concurrent requests per shard
-	concurrencyPerShard := 20
-	if len(webhooks) < concurrencyPerShard {
-		concurrencyPerShard = len(webhooks)
-		if concurrencyPerShard == 0 {
-			concurrencyPerShard = 1
-		}
-	}
-	sem := make(chan struct{}, concurrencyPerShard)
-
-	for _, url := range webhooks {
-		wg.Add(1)
-		// run a goroutine per webhook, sharing the client's transport and the semaphore
-		go webhookLoop(url, payload, config, client, sem, wg, stopCh, globalCount, mu, shardName)
+	if mode == "parallel" {
+		embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{
+			Name:   "Shards",
+			Value:  strings.Join(shards, ", "),
+			Inline: false,
+		})
+	} else {
+		embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{
+			Name:   "Starting Shard",
+			Value:  startingShard,
+			Inline: true,
+		})
 	}
 
-	// Close idle connections when the shard stops
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Embeds: []*discordgo.MessageEmbed{embed},
+		},
+	})
+
+	// Start webhook operations in background
 	go func() {
-		<-stopCh
-		if tr != nil {
-			tr.CloseIdleConnections()
+		var globalCount int
+		var mu sync.Mutex
+
+		if mode == "parallel" {
+			RunParallelMode(shards, h.groups, h.webhookConfig(), &globalCount, &mu, h.state.GetStopChannel())
+		} else {
+			RunSequentialMode(startingShard, h.groups, h.webhookConfig(), &globalCount, &mu, h.state.GetStopChannel())
 		}
+
+		h.state.Stop()
+		slog.Info("Webhook operations completed")
 	}()
 }
 
-// getTotalMessagesForShard calculates total messages sent for a shard.
-func getTotalMessagesForShard(shardName string, groups WebhookGroups, globalCount *int, mu *sync.Mutex) int {
-	mu.Lock()
-	defer mu.Unlock()
-	return *globalCount
+// handleStopCommand handles the /stop command
+func (h *Handler) handleStopCommand(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	// Audit log
+	slog.Info("Command executed",
+		"command", "stop",
+		"user_id", i.Member.User.ID,
+		"user_name", i.Member.User.Username,
+		"guild_id", i.GuildID,
+	)
+
+	if !h.state.IsRunning() {
+		s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+			Type: discordgo.InteractionResponseChannelMessageWithSource,
+			Data: &discordgo.InteractionResponseData{
+				Content: "No webhook operations are currently running.",
+			},
+		})
+		return
+	}
+
+	h.state.Stop()
+
+	embed := &discordgo.MessageEmbed{
+		Title:       "Stopping Webhook Operations",
+		Color:       0xff0000,
+		Description: "All webhook operations are being terminated...",
+		Timestamp:   time.Now().Format(time.RFC3339),
+	}
+
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Embeds: []*discordgo.MessageEmbed{embed},
+		},
+	})
 }
 
-// runParallelMode runs selected shards in parallel.
-func runParallelMode(selectedShards []string, groups WebhookGroups, config *Config, globalCount *int, mu *sync.Mutex, userStopCh chan struct{}) {
-	var wg sync.WaitGroup
-	stopChs := []chan struct{}{}
-
-	for _, shard := range selectedShards {
-		stopCh := make(chan struct{})
-		stopChs = append(stopChs, stopCh)
-		startShard(shard, groups, config, stopCh, globalCount, mu, &wg)
-		fmt.Printf("Started shard: %s\n", shard)
-	}
-
-	// Wait for user stop
-	select {
-	case <-userStopCh:
-		fmt.Println("Stopping all shards...")
-		for _, stopCh := range stopChs {
-			close(stopCh)
-		}
-		wg.Wait()
-	}
+// getConfigString returns a formatted string of current configuration
+func (h *Handler) getConfigString() string {
+	return fmt.Sprintf(
+		"**Message:** `%s`\n"+
+			"**Username:** `%s`\n"+
+			"**Avatar URL:** `%s`\n"+
+			"**Delay:** `%.2f`s\n"+
+			"**Min Delay:** `%.2f`s\n"+
+			"**Max Delay:** `%.2f`s\n"+
+			"**Rate Limit Backoff:** `%.1f`s\n"+
+			"**Max Retries:** `%d`\n"+
+			"**Message Limit:** `%d`\n"+
+			"**Total Pings:** `%d`",
+		h.config.Message,
+		h.config.Username,
+		h.config.AvatarURL,
+		h.config.Delay,
+		h.config.MinDelay,
+		h.config.MaxDelay,
+		h.config.RateLimitBackoff,
+		h.config.MaxRetries,
+		h.config.MessageLimit,
+		h.config.TotalPings,
+	)
 }
 
-// runSequentialMode runs shards in sequence, cycling after total_pings.
-func runSequentialMode(startingShard string, groups WebhookGroups, config *Config, globalCount *int, mu *sync.Mutex, userStopCh chan struct{}) {
-	shardNames := make([]string, 0, len(groups))
-	for name := range groups {
-		shardNames = append(shardNames, name)
-	}
-
-	currentIdx := 0
-	for i, name := range shardNames {
-		if name == startingShard {
-			currentIdx = i
-			break
+// updateConfigField updates a specific configuration field
+func (h *Handler) updateConfigField(field, value string) error {
+	switch field {
+	case "message":
+		if len(value) == 0 {
+			return fmt.Errorf("message cannot be empty")
 		}
-	}
-
-	for {
-		currentShard := shardNames[currentIdx]
-		currentStopCh := make(chan struct{})
-		var currentWg sync.WaitGroup
-
-		fmt.Printf("Starting sequential shard: %s\n", currentShard)
-		startShard(currentShard, groups, config, currentStopCh, globalCount, mu, &currentWg)
-
-		ticker := time.NewTicker(5 * time.Second)
-		defer ticker.Stop()
-
-		stopped := false
-		for !stopped {
-			select {
-			case <-ticker.C:
-				total := getTotalMessagesForShard(currentShard, groups, globalCount, mu)
-				fmt.Printf("Shard %s progress: %d/%d pings\n", currentShard, total, config.TotalPings)
-				if total >= config.TotalPings {
-					close(currentStopCh)
-					currentWg.Wait()
-					// Reset the global counter when switching to the next shard
-					mu.Lock()
-					*globalCount = 0
-					mu.Unlock()
-					stopped = true
-				}
-			case <-userStopCh:
-				close(currentStopCh)
-				currentWg.Wait()
-				stopped = true
-				return // Stop the entire sequential mode
-			case <-currentStopCh:
-				// In case closed externally
-				currentWg.Wait()
-				// Reset the global counter when this shard stops so the next shard starts from 0
-				mu.Lock()
-				*globalCount = 0
-				mu.Unlock()
-				stopped = true
-			}
+		if len(value) > 2000 {
+			return fmt.Errorf("message cannot exceed 2000 characters")
 		}
-
-		currentIdx = (currentIdx + 1) % len(shardNames)
-	}
-}
-
-// inputListener listens for an Enter (empty line) to stop.
-func inputListener(stopCh chan struct{}) {
-	scanner := bufio.NewScanner(os.Stdin)
-	for scanner.Scan() {
-		raw := strings.TrimSpace(scanner.Text())
-		if raw == "" {
-			close(stopCh)
-			return
+		h.config.Message = value
+	case "username":
+		if len(value) == 0 {
+			return fmt.Errorf("username cannot be empty")
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		log.Printf("Input error: %v", err)
-	}
-}
-
-// settingsMenu handles changing settings interactively.
-func settingsMenu(config *Config, configPath string) {
-	editableFields := []string{"message", "username", "avatar_url", "delay", "rate_limit_backoff", "max_retries", "message_limit", "total_pings"}
-
-	for {
-		fmt.Println("\nCurrent Settings:")
-		fmt.Printf("Message: %s\n", config.Message)
-		fmt.Printf("Username: %s\n", config.Username)
-		fmt.Printf("Avatar URL: %s\n", config.AvatarURL)
-		fmt.Printf("Delay: %.2f\n", config.Delay)
-		fmt.Printf("Rate Limit Backoff: %.1f\n", config.RateLimitBackoff)
-		fmt.Printf("Max Retries: %d\n", config.MaxRetries)
-		fmt.Printf("Message Limit: %d\n", config.MessageLimit)
-		fmt.Printf("Total Pings: %d\n", config.TotalPings)
-
-		fmt.Print("\nEnter field to change (" + strings.Join(editableFields, "/") + ") or 'done': ")
-		var field string
-		fmt.Scanln(&field)
-		field = strings.TrimSpace(field)
-
-		if field == "done" {
-			break
+		if len(value) > 80 {
+			return fmt.Errorf("username cannot exceed 80 characters")
 		}
-
-		var newValue string
-		switch field {
-		case "message", "username", "avatar_url":
-			fmt.Printf("New %s: ", field)
-			fmt.Scanln(&newValue)
-			switch field {
-			case "message":
-				config.Message = newValue
-			case "username":
-				config.Username = newValue
-			case "avatar_url":
-				config.AvatarURL = newValue
-			}
-		case "delay":
-			var f float64
-			fmt.Print("New delay: ")
-			fmt.Scanln(&f)
-			config.Delay = f
-		case "rate_limit_backoff":
-			var f float64
-			fmt.Print("New rate limit backoff: ")
-			fmt.Scanln(&f)
-			config.RateLimitBackoff = f
-		case "max_retries":
-			var i int
-			fmt.Print("New max retries: ")
-			fmt.Scanln(&i)
-			config.MaxRetries = i
-		case "message_limit":
-			var i int
-			fmt.Print("New message limit: ")
-			fmt.Scanln(&i)
-			config.MessageLimit = i
-		case "total_pings":
-			var i int
-			fmt.Print("New total pings: ")
-			fmt.Scanln(&i)
-			config.TotalPings = i
-		default:
-			fmt.Println("Invalid field.")
-			continue
+		h.config.Username = value
+	case "avatar_url":
+		if len(value) > 2048 {
+			return fmt.Errorf("avatar_url is too long")
 		}
-
-		if err := saveConfig(config, configPath); err != nil {
-			log.Printf("Failed to save config: %v", err)
-		} else {
-			fmt.Println("Setting updated and saved.")
+		h.config.AvatarURL = value
+	case "delay":
+		f, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return fmt.Errorf("delay must be a number")
 		}
-	}
-}
-
-// startSubmenu handles the start mode selection.
-func startSubmenu(groups WebhookGroups, config *Config, configPath string) {
-	fmt.Println("\n1. Parallel\n2. Sequential")
-	var subChoice int
-	fmt.Scanln(&subChoice)
-
-	var globalCount int
-	var mu sync.Mutex
-	userStopCh := make(chan struct{})
-
-	switch subChoice {
-	case 1: // Parallel (Nobody uses this)
-		fmt.Print("Enter shards (comma-separated): ")
-		var shardsStr string
-		fmt.Scanln(&shardsStr)
-		shards := strings.Split(shardsStr, ",")
-		for i := range shards {
-			shards[i] = strings.TrimSpace(shards[i])
+		if f < 0 || f > 60 {
+			return fmt.Errorf("delay must be between 0 and 60 seconds")
 		}
-		validShards := make([]string, 0, len(shards))
-		for _, s := range shards {
-			// skip empty shard names
-			if s == "" {
-				log.Printf("Invalid shard: %s", s)
-				continue
-			}
-			if _, ok := groups[s]; ok {
-				validShards = append(validShards, s)
-			} else {
-				log.Printf("Invalid shard: %s", s)
-			}
+		h.config.Delay = f
+	case "min_delay":
+		f, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return fmt.Errorf("min_delay must be a number")
 		}
-		if len(validShards) == 0 {
-			fmt.Println("No valid shards selected.")
-			return
+		if f < 0 || f > 60 {
+			return fmt.Errorf("min_delay must be between 0 and 60 seconds")
 		}
-		fmt.Println("Press Enter to stop.")
-		go inputListener(userStopCh)
-		go runParallelMode(validShards, groups, config, &globalCount, &mu, userStopCh)
-		<-userStopCh
-		fmt.Println("Stopping... waiting 5s for clean shutdown.")
-		time.Sleep(5 * time.Second)
-		fmt.Println("Stopped.")
-	case 2: // Sequential (Imagine using a shard selector at the begin lol)
-		fmt.Print("Enter starting shard: ")
-		var startShard string
-		fmt.Scanln(&startShard)
-		startShard = strings.TrimSpace(startShard)
-		if _, ok := groups[startShard]; !ok {
-			fmt.Println("Invalid starting shard.")
-			return
+		h.config.MinDelay = f
+	case "max_delay":
+		f, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return fmt.Errorf("max_delay must be a number")
 		}
-		fmt.Println("Press Enter to stop.")
-		go inputListener(userStopCh)
-		go runSequentialMode(startShard, groups, config, &globalCount, &mu, userStopCh)
-		<-userStopCh
-		fmt.Println("Stopping... waiting 5s for clean shutdown.")
-		time.Sleep(5 * time.Second)
-		fmt.Println("Stopped.")
+		if f < 0 || f > 60 {
+			return fmt.Errorf("max_delay must be between 0 and 60 seconds")
+		}
+		h.config.MaxDelay = f
+	case "rate_limit_backoff":
+		f, err := strconv.ParseFloat(value, 64)
+		if err != nil {
+			return fmt.Errorf("rate_limit_backoff must be a number")
+		}
+		if f < 1 || f > 300 {
+			return fmt.Errorf("rate_limit_backoff must be between 1 and 300 seconds")
+		}
+		h.config.RateLimitBackoff = f
+	case "max_retries":
+		i, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("max_retries must be a number")
+		}
+		if i < 1 || i > 10 {
+			return fmt.Errorf("max_retries must be between 1 and 10")
+		}
+		h.config.MaxRetries = i
+	case "message_limit":
+		i, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("message_limit must be a number")
+		}
+		if i < 1 || i > 10000000 {
+			return fmt.Errorf("message_limit must be between 1 and 10,000,000")
+		}
+		h.config.MessageLimit = i
+	case "total_pings":
+		i, err := strconv.Atoi(value)
+		if err != nil {
+			return fmt.Errorf("total_pings must be a number")
+		}
+		if i < 1 || i > 10000000 {
+			return fmt.Errorf("total_pings must be between 1 and 10,000,000")
+		}
+		h.config.TotalPings = i
 	default:
-		fmt.Println("Invalid choice.")
+		return fmt.Errorf("unknown field: %s", field)
+	}
+
+	// Save config to file
+	return h.saveConfig()
+}
+
+// saveConfig writes the config back to the TOML file (preserves comments natively)
+func (h *Handler) saveConfig() error {
+	// Read original file to preserve comments
+	data, err := os.ReadFile(h.configPath)
+	if err != nil {
+		return err
+	}
+
+	// Parse existing TOML
+	var doc interface{}
+	if _, err := toml.Decode(string(data), &doc); err != nil {
+		return err
+	}
+
+	// Create a buffer with config struct
+	var buf bytes.Buffer
+	encoder := toml.NewEncoder(&buf)
+	if err := encoder.Encode(h.config); err != nil {
+		return err
+	}
+
+	// Write back (TOML library preserves structure)
+	return os.WriteFile(h.configPath, buf.Bytes(), 0644)
+}
+
+// webhookConfig converts Handler config to webhook Config format
+func (h *Handler) webhookConfig() *Config {
+	return &Config{
+		AvatarURL:        h.config.AvatarURL,
+		Delay:            h.config.Delay,
+		MaxDelay:         h.config.MaxDelay,
+		MaxRetries:       h.config.MaxRetries,
+		Message:          h.config.Message,
+		MessageLimit:     h.config.MessageLimit,
+		MinDelay:         h.config.MinDelay,
+		RateLimitBackoff: h.config.RateLimitBackoff,
+		RequestTimeout:   h.config.RequestTimeout,
+		TotalPings:       h.config.TotalPings,
+		Username:         h.config.Username,
+		WebhooksFile:     h.config.WebhooksFile,
 	}
 }
 
-// Core
 func main() {
-	configPath := "config.json"
+	// Initialize structured logging
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
+	slog.Info("Starting Golang-Oblivion Discord Bot", "version", "2.0")
+
+	configPath := "config.toml"
 	config, err := loadConfig(configPath)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("Failed to load configuration", "error", err, "path", configPath)
+		os.Exit(1)
 	}
 
+	// Load bot token from environment variable (preferred) or config file (fallback)
+	botToken := os.Getenv("OBLIVION_BOT_TOKEN")
+	if botToken == "" {
+		botToken = config.BotToken
+	}
+
+	// Validate bot token
+	if botToken == "" || botToken == "YOUR_BOT_TOKEN_HERE" {
+		slog.Error("Invalid bot token", "message", "Please set OBLIVION_BOT_TOKEN environment variable or update config.toml")
+		os.Exit(1)
+	}
+
+	// Load webhook groups
 	webhooksPath := config.WebhooksFile
-	groups, err := loadWebhookGroups(webhooksPath)
+	groups, err := LoadWebhookGroups(webhooksPath)
 	if err != nil {
-		log.Fatal(err)
+		slog.Error("Failed to load webhook groups", "error", err, "path", webhooksPath)
+		os.Exit(1)
 	}
 
-	for {
-		fmt.Println("\n=== Oblivion V2 Menu ===")
-		fmt.Println("1. Start")
-		fmt.Println("2. Settings")
-		fmt.Println("3. Exit")
-		var choice int
-		fmt.Scanln(&choice)
-
-		switch choice {
-		case 1:
-			startSubmenu(groups, config, configPath)
-		case 2:
-			settingsMenu(config, configPath)
-		case 3:
-			fmt.Println("Exiting.")
-			os.Exit(0)
-		default:
-			fmt.Println("Invalid choice.")
-		}
+	// Create Discord session
+	dg, err := discordgo.New("Bot " + botToken)
+	if err != nil {
+		slog.Error("Failed to create Discord session", "error", err)
+		os.Exit(1)
 	}
+
+	// Create command handler
+	handler := NewHandler(config, configPath, groups)
+
+	// Register event handlers
+	dg.AddHandler(handler.HandleInteraction)
+
+	// Set intents
+	dg.Identify.Intents = discordgo.IntentsGuilds
+
+	// Open connection to Discord
+	err = dg.Open()
+	if err != nil {
+		slog.Error("Failed to open connection to Discord", "error", err)
+		os.Exit(1)
+	}
+	defer dg.Close()
+
+	slog.Info("Bot connected to Discord, registering commands...")
+
+	// Register slash commands
+	err = RegisterCommands(dg, config.GuildID)
+	if err != nil {
+		slog.Error("Failed to register commands", "error", err)
+		os.Exit(1)
+	}
+
+	slog.Info("Commands registered successfully")
+	slog.Info("Bot is ready. Press CTRL+C to exit.")
+
+	// Wait for interrupt signal
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+
+	slog.Info("Shutdown signal received, cleaning up...")
+
+	// Unregister commands (optional, but clean)
+	slog.Info("Unregistering commands...")
+	err = UnregisterCommands(dg, config.GuildID)
+	if err != nil {
+		slog.Warn("Failed to unregister commands", "error", err)
+	}
+
+	slog.Info("Shutdown complete. Goodbye!")
 }

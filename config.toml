@@ -1,0 +1,23 @@
+# Discord Bot Configuration
+bot_token = "YOUR_BOT_TOKEN_HERE"  # Get token from https://discord.com/developers/applications
+guild_id = ""  # Optional: Server ID for faster command registration during testing
+
+# Webhook Message Settings
+avatar_url = "https://media.discordapp.net/attachments/1329536982237319239/1375174292303773876/blob-cat-ping.gif"
+message = "@everyone"  # Default message content
+username = "OblivionV2"  # Webhook display name
+
+# Timing Configuration (in seconds)
+delay = 0.3  # Delay between messages
+min_delay = 0.5  # Minimum allowed delay
+max_delay = 5.0  # Maximum allowed delay
+rate_limit_backoff = 60.0  # Wait time when rate limited
+request_timeout = 10.0  # HTTP request timeout
+
+# Operation Limits
+max_retries = 3  # Maximum retry attempts per request
+message_limit = 4000000  # Maximum messages per session
+total_pings = 500  # Messages per shard in sequential mode
+
+# File Paths
+webhooks_file = "webhooks.toml"  # Path to webhooks configuration
