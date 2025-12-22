@@ -54,13 +54,6 @@ make clean     # Remove artifacts
 See `.env.example` for environment variables.
 See `config.toml` for all configuration options with validation.
 
-## Security Features
-
-- Environment variable secrets
-- Input validation (1-2000 char messages, 1-10 retries, etc.)
-- Audit logging for all commands
-- .gitignore protection
-
 ## Logs
 
 Structured JSON logs include contextual fields:
