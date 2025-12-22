@@ -1,0 +1,14 @@
+{
+  "avatar_url": "https://media.discordapp.net/attachments/1329536982237319239/1375174292303773876/blob-cat-ping.gif",
+  "delay": 0.3,
+  "max_delay": 5,
+  "max_retries": 3,
+  "message": "@everyone",
+  "message_limit": 4000000,
+  "min_delay": 0.5,
+  "rate_limit_backoff": 60,
+  "request_timeout": 10,
+  "total_pings": 500,
+  "username": "Oblivion V2",
+  "webhooks_file": "webhooks.json"
+}
