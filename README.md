@@ -82,6 +82,8 @@ Pipe through `jq` for pretty printing:
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
+Check out [TODO.md](TODO.md) for the current roadmap and planned features.
+
 ## License
 
-MIT License
+This project is licensed under the [GNU General Public License v3.0](LICENSE).
