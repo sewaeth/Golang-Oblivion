@@ -2,15 +2,6 @@
 
 A production-ready Discord bot written in Go, managing parallel and sequential webhook shard modes with comprehensive logging and security features.
 
-## Features
-
-- ✅ **Modern Go 1.21+** - Built with latest best practices
-- ✅ **Structured Logging** - JSON-formatted logs with slog
-- ✅ **Input Validation** - Comprehensive bounds checking
-- ✅ **Security** - Environment variable secrets, audit logging
-- ✅ **Safe Concurrency** - Race-free operations
-- ✅ **Build Automation** - Makefile for development
-
 ## Setup
 
 1. **Install Go** (1.21 or higher)
