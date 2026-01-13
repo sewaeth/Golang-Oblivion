@@ -1,0 +1,7 @@
+.env
+*.log
+/oblivion
+bin/
+coverage.out
+*.test
+.DS_Store
